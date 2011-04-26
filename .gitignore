@@ -2,3 +2,6 @@ repositories/
 tmp/
 .*.swp
 .swp
+pkg/*
+*.gem
+.bundle

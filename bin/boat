@@ -1,0 +1,55 @@
+#!/usr/bin/ruby
+
+require 'rubygems'
+require 'boat'
+
+case command = ARGV.shift
+when 'server'
+  Boat::Server.new.run
+
+when 'put'
+  Boat::Put.new.run
+
+when 'configure', 'config'
+  config_file = ARGV.first || Boat::DEFAULT_CLIENT_CONFIGURATION_FILE
+
+  configuration = File.exists?(config_file) ? YAML.load(IO.read(config_file)) : {}
+  puts "Configuring #{config_file}\n\n"
+
+  [["Username", "username"], ["Key", "key"], ["Hostname", "host"]].each do |title, key|
+    print "#{title} [#{configuration[key]}] "
+    input = STDIN.gets.strip
+    configuration[key] = input unless input.empty?
+  end
+
+  File.open(config_file, "w") {|file| file.write configuration.to_yaml}
+
+
+else
+  puts "Unknown command #{command}\n\n" if command && !command.empty? && command != 'help'
+
+  puts <<-EOT
+Boat #{Boat::BOAT_VERSION}
+Copyright 2011 Roger Nesbitt
+
+Boat is a file transfer server and client, made for backing up files.
+
+Server usage:
+
+    boat server [-c config_file]
+        Starts the boat server.
+        Uses /etc/boat.conf if config_file is not specified.
+
+Client usage:
+
+    boat configure [config_file]
+        Configures the username, key and hostname to use.  If no config
+        file is specified, ~/.boat.yml is used by default.
+
+    boat put [-v] [-c config_file] source_filename [destination_filename]
+        Uploads source_filename to the remote server.
+        source_filename may be '-' to upload from stdin, but in this case
+        a destination_filename must be specified.
+
+  EOT
+end
