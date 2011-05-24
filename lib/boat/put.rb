@@ -38,7 +38,7 @@ class Boat::Put
         File.open(filename, "r") {|file| client.put(file, destination_filename)}
       end
       client.quit
-    rescue BoatClient::Error => e
+    rescue Boat::Client::Error => e
       STDERR.puts e.message
       exit(1)
     end

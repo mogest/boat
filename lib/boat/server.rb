@@ -5,8 +5,7 @@ require 'digest'
 require 'fileutils'
 
 class Boat::Server
-  # TODO
-  ROOT_PATH = Dir.pwd
+  ConfigurationError = Class.new(StandardError)
 
   attr_reader :configuration
 
@@ -23,7 +22,7 @@ class Boat::Server
       @@last_connection_id += 1
       @connection_id = @@last_connection_id
       @temporary_files = []
-      send_data "220 Boat Server #{BOAT_VERSION}\n"
+      send_data "220 Boat Server #{Boat::VERSION}\n"
     end
 
     def receive_line(line)
@@ -48,25 +47,25 @@ class Boat::Server
         send_data "500 invalid username\n"
       else
         @username = args
-        @salt = random_salt
-        send_data "251 HMAC-SHA256 #{@salt}\n"
+        @login_salt = random_salt
+        send_data "251 HMAC-SHA256 #{@login_salt}\n"
       end
     end
 
     def command_pass(args)
       if @authenticated
         send_data "500 already authenticated\n"
-      elsif @username.nil? || @salt.nil?
+      elsif @username.nil? || @login_salt.nil?
         send_data "500 USER first\n"
       else
         user = @configuration.fetch("users", {}).fetch(@username, nil)
-        expected = HMAC::SHA256.hexdigest(user["key"], @salt) if user
+        expected = HMAC::SHA256.hexdigest(user["key"], @login_salt) if user
         if user && expected && args == expected
           send_data "250 OK\n"
           @user = user
           @authenticated = true
         else
-          @username = @salt = nil
+          @username = @login_salt = nil
           send_data "401 invalid username or password\n"
         end
       end
@@ -77,17 +76,16 @@ class Boat::Server
 
       if @user["access"] == "r"
         send_data "400 no write access\n"
-      elsif @put_filename
+      elsif @put
         send_data "500 PUT already sent\n"
       elsif !args.match(/\A[a-z0-9_.%+-]+\z/i) # filenames should be urlencoded
         send_data "500 invalid filename\n"
       else
-        repository_path = "#{ROOT_PATH}/repositories/#{@user["repository"]}"
         if @user.fetch("versioning", true) == false && File.exists?("#{repository_path}/current.#{args}")
           send_data "500 file already exists\n"
         else
-          @put_filename = args
-          send_data "250 OK\n"
+          @put = {:state => "PUT", :filename => args, :server_salt => random_salt}
+          send_data "250 #{@put[:server_salt]}\n"
         end
       end
     end
@@ -95,22 +93,37 @@ class Boat::Server
     def command_data(args)
       check_authenticated!
 
-      if @put_filename.nil?
+      if @put.nil?
         send_data "500 PUT first\n"
-      elsif @temporary_id
+      elsif @put[:state] != "PUT"
         send_data "500 DATA already sent\n"
-      elsif !args.match(/\A[0-9]+\z/)
-        send_data "500 invalid size\n"
+      elsif (matches = args.match(/\A([0-9]+) ([0-9a-f]{64}|-) (\S+) ([0-9a-f]{64})\z/i)).nil?
+        send_data "500 invalid DATA command line; requires size, hash, new salt and signature\n"
       else
-        size = args.to_i
+        size = matches[1].to_i
+        file_hash = matches[2].downcase
+        client_salt = matches[3]
+        signature = matches[4].downcase
+
         if size >= 1<<31
           send_data "500 size too large\n"
+        elsif signature != HMAC::SHA256.hexdigest(@user["key"], "#{@put.fetch(:server_salt)}#{@put.fetch(:filename)}#{size}#{file_hash}#{client_salt}")
+          send_data "500 signature is invalid\n"
+        elsif File.exists?(current_filename = "#{repository_path}/current.#{@put.fetch(:filename)}") && Digest::SHA256.file(current_filename).to_s == file_hash
+          signature = HMAC::SHA256.hexdigest(@user["key"], "#{client_salt}#{file_hash}")
+          send_data "255 accepted #{signature}\n"
         else
-          @temporary_id = "#{Time.now.to_i}.#{Process.pid}.#{@connection_id}"
-          @temporary_filename = "#{ROOT_PATH}/tmp/#{@temporary_id}"
-          @file_handle = File.open(@temporary_filename, "w")
-          @temporary_files << @temporary_filename
-          @digest = Digest::SHA256.new
+          @put[:temporary_id] = "#{Time.now.to_i}.#{Process.pid}.#{@connection_id}"
+          @put[:temporary_filename] = "#{@configuration["storage_path"]}/tmp/#{@put.fetch(:temporary_id)}"
+          @put.merge!(
+            :state => "DATA",
+            :size => size,
+            :hash => (file_hash unless file_hash == '-'),
+            :client_salt => client_salt,
+            :file_handle => File.open(@put[:temporary_filename], "w"),
+            :digest => Digest::SHA256.new)
+
+          @temporary_files << @put[:temporary_filename]
 
           send_data "253 send #{size} bytes now\n"
           set_binary_mode size
@@ -118,48 +131,74 @@ class Boat::Server
       end
     end
 
-    def command_confirm(args)
-      check_authenticated!
+    def receive_binary_data(data)
+      @put[:file_handle].write data
+      @put[:digest] << data
+    end
 
-      if @put_file_salt.nil?
-        send_data "500 DATA first\n"
-      elsif args.nil? || (matches = args.match(/\A([0-9a-f]{64}) (\S+)\z/i)).nil?
-        send_data "500 invalid hash\n"
+    def receive_end_of_binary_data
+      @put[:file_handle].close
+
+      if @put.fetch(:hash).nil?
+        @put[:state] = "awaiting CONFIRM"
+        send_data "254 send hash confirmation\n"
       else
-        received_client_hash = matches[1]
-        received_salt = matches[2]
-
-        expected_client_hash = HMAC::SHA256.hexdigest(@user["key"], "#{@put_file_salt}#{@put_file_hash}")
-        if received_client_hash != expected_client_hash
-          send_data "500 invalid confirmation hash\n"
-          return
-        end
-
-        repository_path = "#{ROOT_PATH}/repositories/#{@user["repository"]}"
-        FileUtils.mkdir_p(repository_path)
-        version_filename = "#{repository_path}/#{@temporary_id}.#{@put_filename}"
-        symlink_name = "#{repository_path}/current.#{@put_filename}"
-
-        if @user.fetch("versioning", true) == false && File.exists?(symlink_name)
-          send_data "500 file with same filename was uploaded before this upload completed\n"
-          File.unlink(@temporary_filename)
-          @temporary_files.delete(@temporary_filename)
-          return
-        end
-
-        File.rename(@temporary_filename, version_filename)
-        @temporary_files.delete(@temporary_filename)
-        begin
-          File.unlink(symlink_name) if File.symlink?(symlink_name)
-        rescue Errno::ENOENT
-        end
-        File.symlink(version_filename, symlink_name)
-
-        hash = HMAC::SHA256.hexdigest(@user["key"], "#{received_salt}#{@put_file_hash}")
-        send_data "255 accepted #{hash}\n"
-
-        @file_handle = @put_filename = @temporary_filename = @temporary_id = @put_file_salt = @put_file_hash = nil
+        complete_put
       end
+    end
+
+    def command_confirm(args)
+      if @put.nil? || @put[:state] != "awaiting CONFIRM"
+        send_data "500 no need to send CONFIRM\n"
+      elsif (matches = args.match(/\A([0-9a-f]{64}) ([0-9a-f]{64})\z/i)).nil?
+        send_data "500 invalid CONFIRM command line; requires hash and signature\n"
+      else
+        file_hash = matches[1].downcase
+        signature = matches[2].downcase
+
+        if signature != HMAC::SHA256.hexdigest(@user["key"], "#{@put.fetch(:server_salt)}#{@put.fetch(:filename)}#{@put.fetch(:size)}#{file_hash}#{@put.fetch(:client_salt)}")
+          send_data "500 signature is invalid\n"
+          @put = nil
+        else
+          @put[:hash] = file_hash
+          complete_put
+        end
+      end
+    end
+
+    def complete_put
+      calculated_hash = @put.fetch(:digest).to_s
+
+      if @put.fetch(:hash) != calculated_hash
+        send_data "500 file hash does not match hash supplied by client\n"
+        File.unlink(@put.fetch(:temporary_filename))
+        @temporary_files.delete(@put.fetch(:temporary_filename))
+        return
+      end
+
+      FileUtils.mkdir_p(repository_path)
+      version_filename = "#{repository_path}/#{@put.fetch(:temporary_id)}.#{@put.fetch(:filename)}"
+      symlink_name = "#{repository_path}/current.#{@put.fetch(:filename)}"
+
+      if @user.fetch("versioning", true) == false && File.exists?(symlink_name)
+        send_data "500 file with same filename was uploaded before this upload completed\n"
+        File.unlink(@put.fetch(:temporary_filename))
+        @temporary_files.delete(@put.fetch(:temporary_filename))
+        return
+      end
+
+      File.rename(@put.fetch(:temporary_filename), version_filename)
+      @temporary_files.delete(@put.fetch(:temporary_filename))
+      begin
+        File.unlink(symlink_name) if File.symlink?(symlink_name)
+      rescue Errno::ENOENT
+      end
+      File.symlink(version_filename, symlink_name)
+
+      signature = HMAC::SHA256.hexdigest(@user["key"], "#{@put.fetch(:client_salt)}#{@put.fetch(:hash)}")
+      send_data "255 accepted #{signature}\n"
+    ensure
+      @put = nil
     end
 
     def command_get(args)
@@ -179,20 +218,6 @@ class Boat::Server
       end
     end
 
-    def receive_binary_data(data)
-      @file_handle.write data
-      @digest << data
-    end
-
-    def receive_end_of_binary_data
-      @file_handle.close
-      @put_file_hash = @digest.to_s
-      @put_file_salt = random_salt
-      @digest = nil
-
-      send_data "254 confirm #{@put_file_hash} #{@put_file_salt}\n"
-    end
-
     def unbind
       @temporary_files.each do |filename|
         begin
@@ -205,34 +230,51 @@ class Boat::Server
     def random_salt
       [Digest::SHA256.digest((0..64).inject("") {|r, i| r << rand(256).chr})].pack("m").strip
     end
+
+    def repository_path
+      @user && "#{@configuration.fetch("storage_path")}/repositories/#{@user.fetch("repository")}"
+    end
   end
 
+  def load_configuration
+    unless File.exists?(@config_file)
+      raise "configuration file #{config_file} does not exist"
+    end
+
+    configuration = YAML.load(IO.read(@config_file))
+    if configuration["users"].nil? || configuration["users"].empty?
+      raise "configuration file does not have any users defined in it"
+    end
+
+    configuration["storage_path"] ||= Boat::DEFAULT_STORAGE_DIRECTORY
+    FileUtils.mkdir_p("#{configuration["storage_path"]}/tmp")
+
+    @configuration.update(configuration)
+  rescue => e
+    raise ConfigurationError, e.message, $@
+  end
 
   def run
     trap('SIGINT') { exit }
     trap('SIGTERM') { exit }
 
-    # TODO
-    FileUtils.mkdir_p("#{ROOT_PATH}/tmp")
-
     while ARGV.first && ARGV.first[0..0] == '-' && ARGV.first.length > 1
       case opt = ARGV.shift
-      when '-c'
-        config_file = ARGV.shift
-
-      else
-        raise "unknown commandline option #{opt}"
+      when '-c' then @config_file = ARGV.shift
+      else           raise "unknown commandline option #{opt}"
       end
     end
 
-    config_file ||= Boat::DEFAULT_SERVER_CONFIGURATION_FILE
-    unless File.exists?(config_file)
-      raise "configuration file #{config_file} does not exist"
-    end
+    @config_file ||= Boat::DEFAULT_SERVER_CONFIGURATION_FILE
+    @configuration = {}
+    load_configuration
 
-    @configuration = YAML.load(IO.read(config_file))
-    if @configuration["users"].nil? || @configuration["users"].empty?
-      raise "configuration file does not have any users defined in it"
+    trap('SIGHUP') do
+      begin
+        load_configuration
+      rescue ConfigurationError => e
+        STDERR.puts "Could not reload configuration file: #{e.message}"
+      end
     end
 
     #Syslog.open 'boat'
