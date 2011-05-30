@@ -1,7 +1,5 @@
-require 'hmac/sha2'
+require 'openssl'
 require 'eventmachine'
-require 'syslog'
-require 'digest'
 require 'fileutils'
 
 class Boat::Server
@@ -22,6 +20,7 @@ class Boat::Server
       @@last_connection_id += 1
       @connection_id = @@last_connection_id
       @temporary_files = []
+      @digest = OpenSSL::Digest::Digest.new('sha256')
       send_data "220 Boat Server #{Boat::VERSION}\n"
     end
 
@@ -59,7 +58,7 @@ class Boat::Server
         send_data "500 USER first\n"
       else
         user = @configuration.fetch("users", {}).fetch(@username, nil)
-        expected = HMAC::SHA256.hexdigest(user["key"], @login_salt) if user
+        expected = OpenSSL::HMAC.hexdigest(@digest, user["key"], @login_salt) if user
         if user && expected && args == expected
           send_data "250 OK\n"
           @user = user
@@ -107,10 +106,10 @@ class Boat::Server
 
         if size >= 1<<31
           send_data "500 size too large\n"
-        elsif signature != HMAC::SHA256.hexdigest(@user["key"], "#{@put.fetch(:server_salt)}#{@put.fetch(:filename)}#{size}#{file_hash}#{client_salt}")
+        elsif signature != OpenSSL::HMAC.hexdigest(@digest, @user["key"], "#{@put.fetch(:server_salt)}#{@put.fetch(:filename)}#{size}#{file_hash}#{client_salt}")
           send_data "500 signature is invalid\n"
-        elsif File.exists?(current_filename = "#{repository_path}/current.#{@put.fetch(:filename)}") && Digest::SHA256.file(current_filename).to_s == file_hash
-          signature = HMAC::SHA256.hexdigest(@user["key"], "#{client_salt}#{file_hash}")
+        elsif File.exists?(current_filename = "#{repository_path}/current.#{@put.fetch(:filename)}") && OpenSSL::Digest.new('sha256').file(current_filename).to_s == file_hash
+          signature = OpenSSL::HMAC.hexdigest(@digest, @user["key"], "#{client_salt}#{file_hash}")
           send_data "255 accepted #{signature}\n"
         else
           @put[:temporary_id] = "#{Time.now.to_i}.#{Process.pid}.#{@connection_id}"
@@ -121,7 +120,7 @@ class Boat::Server
             :hash => (file_hash unless file_hash == '-'),
             :client_salt => client_salt,
             :file_handle => File.open(@put[:temporary_filename], "w"),
-            :digest => Digest::SHA256.new)
+            :digest => OpenSSL::Digest.new('sha256'))
 
           @temporary_files << @put[:temporary_filename]
 
@@ -156,7 +155,7 @@ class Boat::Server
         file_hash = matches[1].downcase
         signature = matches[2].downcase
 
-        if signature != HMAC::SHA256.hexdigest(@user["key"], "#{@put.fetch(:server_salt)}#{@put.fetch(:filename)}#{@put.fetch(:size)}#{file_hash}#{@put.fetch(:client_salt)}")
+        if signature != OpenSSL::HMAC.hexdigest(@digest, @user["key"], "#{@put.fetch(:server_salt)}#{@put.fetch(:filename)}#{@put.fetch(:size)}#{file_hash}#{@put.fetch(:client_salt)}")
           send_data "500 signature is invalid\n"
           @put = nil
         else
@@ -167,7 +166,7 @@ class Boat::Server
     end
 
     def complete_put
-      calculated_hash = @put.fetch(:digest).to_s
+      calculated_hash = @put.fetch(:digest).hexdigest
 
       if @put.fetch(:hash) != calculated_hash
         send_data "500 file hash does not match hash supplied by client\n"
@@ -195,7 +194,7 @@ class Boat::Server
       end
       File.symlink(version_filename, symlink_name)
 
-      signature = HMAC::SHA256.hexdigest(@user["key"], "#{@put.fetch(:client_salt)}#{@put.fetch(:hash)}")
+      signature = OpenSSL::HMAC.hexdigest(@digest, @user["key"], "#{@put.fetch(:client_salt)}#{@put.fetch(:hash)}")
       send_data "255 accepted #{signature}\n"
     ensure
       @put = nil
@@ -228,7 +227,7 @@ class Boat::Server
     end
 
     def random_salt
-      [Digest::SHA256.digest((0..64).inject("") {|r, i| r << rand(256).chr})].pack("m").strip
+      [OpenSSL::Digest.new('sha256').digest((0..64).inject("") {|r, i| r << rand(256).chr})].pack("m").strip
     end
 
     def repository_path
@@ -276,8 +275,6 @@ class Boat::Server
         STDERR.puts "Could not reload configuration file: #{e.message}"
       end
     end
-
-    #Syslog.open 'boat'
 
     File.umask(0077)
     EventMachine.run do

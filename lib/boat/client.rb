@@ -1,4 +1,4 @@
-require 'hmac/sha2'
+require 'openssl'
 require 'socket'
 
 class Boat::Client
@@ -21,7 +21,7 @@ class Boat::Client
     raise Error, response unless response =~ /^251 HMAC-SHA256 (.+)/
 
     puts "[debug] sending password" if @debug
-    password_hash = HMAC::SHA256.hexdigest(key, $1)
+    password_hash = OpenSSL::HMAC.hexdigest(OpenSSL::Digest.new('sha256'), key, $1)
     socket_puts "pass #{password_hash}"
     response = socket_gets.to_s
     raise Error, response unless response =~ /^250/
@@ -37,16 +37,17 @@ class Boat::Client
 
     size ||= io.respond_to?(:stat) ? io.stat.size : io.length
 
+    digest = OpenSSL::Digest.new('sha256')
     hash ||= if io.respond_to?(:path)
-      Digest::SHA256.file(io.path)
+      digest.file(io.path).hexdigest
     elsif !io.respond_to?(:read)
-      Digest::SHA256.hexdigest(io)
+      digest.hexdigest(io)
     else
       "-"
     end
 
-    client_salt = [Digest::SHA256.digest((0..64).inject("") {|r, i| r << rand(256).chr})].pack("m").strip
-    signature = HMAC::SHA256.hexdigest(@key, "#{server_salt}#{encoded_filename}#{size}#{hash}#{client_salt}")
+    client_salt = [digest.digest((0..64).inject("") {|r, i| r << rand(256).chr})].pack("m").strip
+    signature = OpenSSL::HMAC.hexdigest(digest, @key, "#{server_salt}#{encoded_filename}#{size}#{hash}#{client_salt}")
 
     puts "[debug] sending data command" if @debug
     socket_puts "data #{size} #{hash} #{client_salt} #{signature}"
@@ -54,7 +55,7 @@ class Boat::Client
 
     # The server might already have the file with this hash - if so it'll return 255 at this point.
     if matches = response.strip.match(/\A255 accepted ([0-9a-f]{64})\z/i)
-      confirm_hash = HMAC::SHA256.hexdigest(@key, "#{client_salt}#{hash}")
+      confirm_hash = OpenSSL::HMAC.hexdigest(digest, @key, "#{client_salt}#{hash}")
       if matches[1] != confirm_hash
         raise Error, "Incorrect server signature; the srver may be faking that it received the upload"
       end
@@ -64,7 +65,7 @@ class Boat::Client
     raise Error, response unless response =~ /^253/
 
     if io.respond_to?(:read)
-      digest = Digest::SHA256.new if hash == '-'
+      digest = OpenSSL::Digest.new('sha256') if hash == '-'
       written = 0
       while data = io.read(@chunk_size)
         if @debug
@@ -86,7 +87,7 @@ class Boat::Client
 
     if response =~ /^254/ # we need to send the hash of the file because we didn't on the DATA line
       hash = digest.to_s
-      signature = HMAC::SHA256.hexdigest(@key, "#{server_salt}#{encoded_filename}#{size}#{hash}#{client_salt}")
+      signature = OpenSSL::HMAC.hexdigest(digest, @key, "#{server_salt}#{encoded_filename}#{size}#{hash}#{client_salt}")
 
       puts "[debug] sending confirm command" if @debug
       socket_puts "confirm #{hash} #{signature}\n"
@@ -95,7 +96,7 @@ class Boat::Client
 
     raise Error, response unless response && matches = response.strip.match(/\A255 accepted ([0-9a-f]{64})\z/i)
 
-    confirm_hash = HMAC::SHA256.hexdigest(@key, "#{client_salt}#{hash}")
+    confirm_hash = OpenSSL::HMAC.hexdigest(digest, @key, "#{client_salt}#{hash}")
     if matches[1] != confirm_hash
       raise Error, "Incorrect server signature; the srver may be faking that it received the upload"
     end
