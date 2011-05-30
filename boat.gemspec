@@ -11,9 +11,6 @@ Gem::Specification.new do |s|
   s.summary     = "File upload client and server specifically aimed at transferring already-encrypted backups"
   s.description = s.summary
 
-  s.required_rubygems_version = ">= 1.3.6"
-  s.rubyforge_project         = "boat"
-
   s.files        = `git ls-files`.split("\n")
   s.executables  = `git ls-files`.split("\n").map{|f| f =~ /^bin\/(.*)/ ? $1 : nil}.compact
   s.require_path = 'lib'
