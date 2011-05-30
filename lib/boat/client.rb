@@ -38,7 +38,7 @@ class Boat::Client
     size ||= io.respond_to?(:stat) ? io.stat.size : io.length
 
     digest = OpenSSL::Digest.new('sha256')
-    hash ||= if io.respond_to?(:path)
+    hash ||= if io.respond_to?(:path) && io.path
       digest.file(io.path).hexdigest
     elsif !io.respond_to?(:read)
       digest.hexdigest(io)
