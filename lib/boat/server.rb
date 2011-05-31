@@ -42,7 +42,7 @@ class Boat::Server
     def command_user(args)
       if @authenticated
         send_data "500 already authenticated\n"
-      elsif args.empty? || args.match(/[^a-z0-9_]/i)
+      elsif args.empty? || args.match(/[^a-z0-9_.]/i)
         send_data "500 invalid username\n"
       else
         @username = args
