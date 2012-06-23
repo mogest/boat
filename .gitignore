@@ -5,3 +5,8 @@ tmp/
 pkg/*
 *.gem
 .bundle
+server/*.o
+server/boatd
+server/boat.conf
+server/key
+server/cert
